@@ -1,0 +1,5 @@
+{
+  "name": "DevProof Dashboard",
+  "description": "A professional developer activity dashboard to visualize GitHub contributions, commits, and PRs.",
+  "requestFramePermissions": []
+}
