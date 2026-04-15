@@ -29,6 +29,10 @@ Dashboard aktivitas tim engineering berbasis GitHub. Project ini menampilkan com
    GITHUB_REPOS=""
    GITHUB_TOKEN="your-token"
    GITHUB_WEBHOOK_SECRET="your-secret"
+   GITHUB_QA_USERS="qa-user"
+   GITHUB_FRONTEND_USERS="frontend-user"
+   GITHUB_BACKEND_USERS="backend-user"
+   GITHUB_CONTRIBUTOR_ROLES="lead-user:Tech Lead"
    VITE_API_BASE_URL="http://localhost:8787"
    ```
 
@@ -55,5 +59,6 @@ Saat webhook masuk, cache akan dibersihkan, dashboard di-warm ulang, lalu fronte
 ## Notes
 
 - Jika `GITHUB_REPOS` kosong, dashboard akan membaca semua repo milik `GITHUB_OWNER`
+- Gunakan `GITHUB_QA_USERS`, `GITHUB_FRONTEND_USERS`, `GITHUB_BACKEND_USERS`, dan `GITHUB_CONTRIBUTOR_ROLES` untuk memberi label role pada contributor
 - Data bersifat near real-time, bukan live per detik
 - Endpoint health tersedia di `/api/health`

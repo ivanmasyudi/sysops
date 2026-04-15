@@ -117,6 +117,7 @@ type TopRepo = {
   name: string;
   commits: number;
   language: string;
+  contributors: TeamMember[];
 };
 
 type TeamMember = {
@@ -129,10 +130,18 @@ type TeamMember = {
 
 type RepoProjectStat = {
   name: string;
-  todo: number;
-  inProgress: number;
+  statuses: Array<{
+    name: string;
+    count: number;
+  }>;
+  openIssues: number;
+  closedIssues: number;
+  openPullRequests: number;
+  mergedPullRequests: number;
   done: number;
   total: number;
+  source?: 'github-project' | 'activity-fallback';
+  projectTitle?: string | null;
 };
 
 type WorkDistribution = {
@@ -208,6 +217,12 @@ type CacheEntry = {
   source: 'request' | 'webhook-preload';
 };
 
+type GithubViewer = {
+  login: string;
+  type: string;
+  name?: string | null;
+};
+
 type DashboardTimings = {
   totalMs: number;
   resolveReposMs: number;
@@ -216,6 +231,37 @@ type DashboardTimings = {
   repoCount: number;
   cacheStatus: 'hit' | 'miss';
   selectedDays: number;
+};
+
+type GithubGraphqlResponse<T> = {
+  data?: T;
+  errors?: Array<{ message: string }>;
+};
+
+type GithubProjectItemFieldValue = {
+  name?: string | null;
+  field?: {
+    name?: string | null;
+  } | null;
+};
+
+type GithubProjectV2Node = {
+  title: string;
+  fields: {
+    nodes: Array<{
+      name?: string | null;
+      options?: Array<{
+        name: string;
+      }>;
+    }>;
+  };
+  items: {
+    nodes: Array<{
+      fieldValues: {
+        nodes: GithubProjectItemFieldValue[];
+      };
+    }>;
+  };
 };
 
 const GITHUB_API_BASE = 'https://api.github.com';
@@ -228,6 +274,57 @@ const COLORS = {
 
 const cache = new Map<string, CacheEntry>();
 const DEFAULT_CACHE_TTL_MS = 60 * 1000;
+
+function parseGithubLoginList(raw: string | undefined): string[] {
+  return (raw ?? '')
+    .split(',')
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function getContributorRoleMap(): Map<string, string> {
+  const roleMap = new Map<string, string>();
+  const roleGroups: Array<[string | undefined, string]> = [
+    [process.env.GITHUB_QA_USERS, 'QA'],
+    [process.env.GITHUB_FRONTEND_USERS, 'Frontend Engineer'],
+    [process.env.GITHUB_BACKEND_USERS, 'Backend Engineer'],
+    [process.env.GITHUB_FULLSTACK_USERS, 'Fullstack Engineer'],
+    [process.env.GITHUB_DEVOPS_USERS, 'DevOps Engineer'],
+    [process.env.GITHUB_PM_USERS, 'Project Manager'],
+    [process.env.GITHUB_DESIGN_USERS, 'UI/UX Designer'],
+  ];
+
+  roleGroups.forEach(([rawUsers, role]) => {
+    parseGithubLoginList(rawUsers).forEach((login) => {
+      roleMap.set(login, role);
+    });
+  });
+
+  const customMappings = (process.env.GITHUB_CONTRIBUTOR_ROLES ?? '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+
+  customMappings.forEach((entry) => {
+    const separatorIndex = entry.indexOf(':');
+    if (separatorIndex === -1) {
+      return;
+    }
+
+    const login = entry.slice(0, separatorIndex).trim().toLowerCase();
+    const role = entry.slice(separatorIndex + 1).trim();
+
+    if (login && role) {
+      roleMap.set(login, role);
+    }
+  });
+
+  return roleMap;
+}
+
+function resolveContributorRole(loginOrName: string, roleMap: Map<string, string>): string {
+  return roleMap.get(loginOrName.trim().toLowerCase()) ?? 'Contributor';
+}
 
 function createCacheKey(owner: string, repos: string[], days: number): string {
   return JSON.stringify({
@@ -265,12 +362,170 @@ async function githubRequest<T>(path: string, token: string): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+async function githubGraphqlRequest<T>(query: string, variables: Record<string, unknown>, token: string): Promise<T> {
+  const response = await fetch(`${GITHUB_API_BASE}/graphql`, {
+    method: 'POST',
+    headers: {
+      ...getAuthHeaders(token),
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+
+  const payload = (await response.json()) as GithubGraphqlResponse<T>;
+  if (!response.ok) {
+    throw new Error(`GitHub GraphQL ${response.status}: ${JSON.stringify(payload)}`);
+  }
+
+  if (payload.errors?.length) {
+    throw new Error(`GitHub GraphQL error: ${payload.errors.map((error) => error.message).join('; ')}`);
+  }
+
+  if (!payload.data) {
+    throw new Error('GitHub GraphQL error: Missing data');
+  }
+
+  return payload.data;
+}
+
+async function getAuthenticatedViewer(token: string): Promise<GithubViewer> {
+  return githubRequest<GithubViewer>('/user', token);
+}
+
+export async function getGithubDebugSnapshot(owner: string, token: string, configuredRepos: string[]) {
+  const viewerResponse = await fetch(`${GITHUB_API_BASE}/user`, {
+    headers: getAuthHeaders(token),
+  });
+
+  const viewerScopes = viewerResponse.headers.get('x-oauth-scopes');
+  const acceptedScopes = viewerResponse.headers.get('x-accepted-oauth-scopes');
+  let viewer: GithubViewer | null = null;
+  let viewerError: string | null = null;
+
+  if (viewerResponse.ok) {
+    viewer = (await viewerResponse.json()) as GithubViewer;
+  } else {
+    viewerError = `GitHub API ${viewerResponse.status}: ${await viewerResponse.text()}`;
+  }
+
+  let resolvedRepos: GithubRepo[] = [];
+  let resolveError: string | null = null;
+
+  try {
+    resolvedRepos = await resolveRepos(owner, token, configuredRepos);
+  } catch (error) {
+    resolveError = error instanceof Error ? error.message : 'Unknown error';
+  }
+
+  const ownerReposResponse = await fetch(`${GITHUB_API_BASE}/users/${owner}/repos?per_page=100&type=owner&sort=updated`, {
+    headers: getAuthHeaders(token),
+  });
+  const ownerReposStatus = ownerReposResponse.status;
+  const ownerReposOk = ownerReposResponse.ok;
+  let ownerReposCount: number | null = null;
+  let ownerReposPreview: string[] = [];
+  let ownerReposError: string | null = null;
+
+  if (ownerReposResponse.ok) {
+    const ownerRepos = (await ownerReposResponse.json()) as GithubRepo[];
+    ownerReposCount = ownerRepos.length;
+    ownerReposPreview = ownerRepos.slice(0, 10).map((repo) => repo.name);
+  } else {
+    ownerReposError = await ownerReposResponse.text();
+  }
+
+  const authenticatedUserReposResponse = await fetch(
+    `${GITHUB_API_BASE}/user/repos?per_page=100&visibility=all&affiliation=owner&sort=updated`,
+    {
+      headers: getAuthHeaders(token),
+    },
+  );
+  const authenticatedUserReposStatus = authenticatedUserReposResponse.status;
+  const authenticatedUserReposOk = authenticatedUserReposResponse.ok;
+  let authenticatedUserReposCount: number | null = null;
+  let authenticatedUserReposPreview: string[] = [];
+  let authenticatedUserReposError: string | null = null;
+
+  if (authenticatedUserReposResponse.ok) {
+    const authenticatedUserRepos = (await authenticatedUserReposResponse.json()) as GithubRepo[];
+    authenticatedUserReposCount = authenticatedUserRepos.length;
+    authenticatedUserReposPreview = authenticatedUserRepos.slice(0, 10).map((repo) => repo.name);
+  } else {
+    authenticatedUserReposError = await authenticatedUserReposResponse.text();
+  }
+
+  const orgReposResponse = await fetch(`${GITHUB_API_BASE}/orgs/${owner}/repos?per_page=100&type=all&sort=updated`, {
+    headers: getAuthHeaders(token),
+  });
+  const orgReposStatus = orgReposResponse.status;
+  const orgReposOk = orgReposResponse.ok;
+  let orgReposCount: number | null = null;
+  let orgReposPreview: string[] = [];
+  let orgReposError: string | null = null;
+
+  if (orgReposResponse.ok) {
+    const orgRepos = (await orgReposResponse.json()) as GithubRepo[];
+    orgReposCount = orgRepos.length;
+    orgReposPreview = orgRepos.slice(0, 10).map((repo) => repo.name);
+  } else {
+    orgReposError = await orgReposResponse.text();
+  }
+
+  return {
+    timestamp: new Date().toISOString(),
+    owner,
+    configuredRepos,
+    viewer,
+    viewerError,
+    tokenScopes: viewerScopes ? viewerScopes.split(',').map((scope) => scope.trim()).filter(Boolean) : [],
+    acceptedOauthScopes:
+      acceptedScopes ? acceptedScopes.split(',').map((scope) => scope.trim()).filter(Boolean) : [],
+    resolveRepos: {
+      count: resolvedRepos.length,
+      names: resolvedRepos.map((repo) => repo.name),
+      error: resolveError,
+    },
+    ownerReposProbe: {
+      endpoint: `/users/${owner}/repos?type=owner`,
+      ok: ownerReposOk,
+      status: ownerReposStatus,
+      count: ownerReposCount,
+      names: ownerReposPreview,
+      error: ownerReposError,
+    },
+    authenticatedUserReposProbe: {
+      endpoint: '/user/repos?visibility=all&affiliation=owner',
+      ok: authenticatedUserReposOk,
+      status: authenticatedUserReposStatus,
+      count: authenticatedUserReposCount,
+      names: authenticatedUserReposPreview,
+      error: authenticatedUserReposError,
+    },
+    orgReposProbe: {
+      endpoint: `/orgs/${owner}/repos?type=all`,
+      ok: orgReposOk,
+      status: orgReposStatus,
+      count: orgReposCount,
+      names: orgReposPreview,
+      error: orgReposError,
+    },
+  };
+}
+
 async function resolveRepos(owner: string, token: string, configuredRepos: string[]): Promise<GithubRepo[]> {
   if (configuredRepos.length > 0) {
     const repos = await Promise.all(
       configuredRepos.map((repo) => githubRequest<GithubRepo>(`/repos/${owner}/${repo}`, token)),
     );
     return repos;
+  }
+
+  const viewer = await getAuthenticatedViewer(token).catch(() => null);
+  if (viewer?.login?.toLowerCase() === owner.toLowerCase() && viewer.type === 'User') {
+    return githubRequest<GithubRepo[]>(
+      '/user/repos?per_page=100&visibility=all&affiliation=owner&sort=updated',
+      token,
+    );
   }
 
   try {
@@ -386,6 +641,10 @@ function scoreIntensity(count: number): number {
   return 4;
 }
 
+function isOnOrAfterRange(input: string | null | undefined, rangeStartMs: number): boolean {
+  return Boolean(input) && new Date(input as string).getTime() >= rangeStartMs;
+}
+
 function classifyWork(text: string, labels: string[]): 'feature' | 'fix' | 'maintenance' {
   const haystack = `${text} ${labels.join(' ')}`.toLowerCase();
   if (/(fix|bug|error|incident|hotfix|defect|patch)/.test(haystack)) {
@@ -398,10 +657,19 @@ function classifyWork(text: string, labels: string[]): 'feature' | 'fix' | 'main
 }
 
 async function fetchRepoCommits(owner: string, repo: string, token: string, sinceIso: string) {
-  return githubRequest<GithubCommit[]>(
-    `/repos/${owner}/${repo}/commits?per_page=100&since=${encodeURIComponent(sinceIso)}`,
-    token,
-  );
+  try {
+    return await githubRequest<GithubCommit[]>(
+      `/repos/${owner}/${repo}/commits?per_page=100&since=${encodeURIComponent(sinceIso)}`,
+      token,
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes('Git Repository is empty')) {
+      return [];
+    }
+
+    throw error;
+  }
 }
 
 async function fetchRepoPulls(owner: string, repo: string, token: string) {
@@ -425,17 +693,138 @@ async function fetchRepoMilestones(owner: string, repo: string, token: string) {
   );
 }
 
+function isDoneLikeStatus(statusName: string): boolean {
+  return ['done', 'complete', 'completed', 'closed'].includes(statusName.trim().toLowerCase());
+}
+
+async function fetchRepoProjectStat(
+  owner: string,
+  repo: string,
+  token: string,
+): Promise<
+  Pick<
+    RepoProjectStat,
+    'statuses' | 'openIssues' | 'closedIssues' | 'openPullRequests' | 'mergedPullRequests' | 'done' | 'total' | 'source' | 'projectTitle'
+  > | null
+> {
+  const data = await githubGraphqlRequest<{
+    repository: {
+      projectsV2: {
+        nodes: GithubProjectV2Node[];
+      };
+    } | null;
+  }>(
+    `
+      query RepoProjects($owner: String!, $repo: String!) {
+        repository(owner: $owner, name: $repo) {
+          projectsV2(first: 20, orderBy: { field: UPDATED_AT, direction: DESC }) {
+            nodes {
+              title
+              fields(first: 20) {
+                nodes {
+                  ... on ProjectV2SingleSelectField {
+                    name
+                    options {
+                      name
+                    }
+                  }
+                }
+              }
+              items(first: 100) {
+                nodes {
+                  fieldValues(first: 20) {
+                    nodes {
+                      ... on ProjectV2ItemFieldSingleSelectValue {
+                        name
+                        field {
+                          ... on ProjectV2Field {
+                            name
+                          }
+                          ... on ProjectV2SingleSelectField {
+                            name
+                          }
+                          ... on ProjectV2IterationField {
+                            name
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    `,
+    { owner, repo },
+    token,
+  );
+
+  const projects = data.repository?.projectsV2.nodes ?? [];
+  if (projects.length === 0) {
+    return null;
+  }
+
+  const matchingProject =
+    projects.find((project) => project.title.trim().toLowerCase() === repo.trim().toLowerCase()) ?? projects[0];
+
+  const statusField = matchingProject.fields.nodes.find((field) => field.name === 'Status');
+  const orderedStatuses = (statusField?.options ?? []).map((option) => ({
+    name: option.name,
+    count: 0,
+  }));
+  const statusMap = new Map(orderedStatuses.map((status) => [status.name, status]));
+
+  matchingProject.items.nodes.forEach((item) => {
+    const statusValue = item.fieldValues.nodes.find(
+      (fieldValue) => fieldValue.field?.name === 'Status' && fieldValue.name,
+    );
+    if (!statusValue?.name) {
+      return;
+    }
+
+    const existingStatus = statusMap.get(statusValue.name);
+    if (existingStatus) {
+      existingStatus.count += 1;
+      return;
+    }
+
+    const dynamicStatus = { name: statusValue.name, count: 1 };
+    orderedStatuses.push(dynamicStatus);
+    statusMap.set(statusValue.name, dynamicStatus);
+  });
+
+  const statuses = orderedStatuses.filter((status) => status.count > 0 || orderedStatuses.length <= 6);
+
+  return {
+    statuses,
+    openIssues: 0,
+    closedIssues: 0,
+    openPullRequests: 0,
+    mergedPullRequests: 0,
+    done: statuses
+      .filter((status) => isDoneLikeStatus(status.name))
+      .reduce((sum, status) => sum + status.count, 0),
+    total: statuses.reduce((sum, status) => sum + status.count, 0),
+    source: 'github-project',
+    projectTitle: matchingProject.title,
+  };
+}
+
 async function collectRepoAggregate(
   owner: string,
   repo: GithubRepo,
   token: string,
   since: string,
 ): Promise<RepoAggregate> {
-  const [commits, pulls, issues, repoMilestones] = await Promise.all([
+  const contributorRoleMap = getContributorRoleMap();
+  const [commits, pulls, issues, repoMilestones, githubProjectStat] = await Promise.all([
     fetchRepoCommits(owner, repo.name, token, since),
     fetchRepoPulls(owner, repo.name, token),
     fetchRepoIssues(owner, repo.name, token),
     fetchRepoMilestones(owner, repo.name, token).catch(() => []),
+    fetchRepoProjectStat(owner, repo.name, token).catch(() => null),
   ]);
 
   const rangeStartMs = new Date(since).getTime();
@@ -476,7 +865,7 @@ async function collectRepoAggregate(
     } else {
       contributors.set(contributorKey, {
         name: contributorKey,
-        role: 'Contributor',
+        role: resolveContributorRole(contributorKey, contributorRoleMap),
         avatar:
           commit.author?.avatar_url ??
           `https://ui-avatars.com/api/?name=${encodeURIComponent(contributorKey)}&background=0f172a&color=ffffff`,
@@ -486,29 +875,30 @@ async function collectRepoAggregate(
     }
   });
 
-  pulls
-    .filter((pull) => new Date(pull.updated_at).getTime() >= rangeStartMs)
-    .forEach((pull) => {
+  pulls.forEach((pull) => {
+    if (isOnOrAfterRange(pull.created_at, rangeStartMs)) {
       const createdKey = pull.created_at.slice(0, 10);
-      const closedKey = pull.closed_at?.slice(0, 10);
-      const mergedKey = pull.merged_at?.slice(0, 10);
       const bucket = prBuckets.get(createdKey) ?? { merged: 0, open: 0, closed: 0 };
       bucket.open += 1;
       prBuckets.set(createdKey, bucket);
+    }
 
-      if (closedKey) {
-        const closedBucket = prBuckets.get(closedKey) ?? { merged: 0, open: 0, closed: 0 };
-        closedBucket.closed += 1;
-        prBuckets.set(closedKey, closedBucket);
-      }
+    if (isOnOrAfterRange(pull.closed_at, rangeStartMs) && pull.closed_at) {
+      const closedKey = pull.closed_at.slice(0, 10);
+      const closedBucket = prBuckets.get(closedKey) ?? { merged: 0, open: 0, closed: 0 };
+      closedBucket.closed += 1;
+      prBuckets.set(closedKey, closedBucket);
+    }
 
-      if (mergedKey) {
-        const mergedBucket = prBuckets.get(mergedKey) ?? { merged: 0, open: 0, closed: 0 };
-        mergedBucket.merged += 1;
-        prBuckets.set(mergedKey, mergedBucket);
-        mergedPrs += 1;
-      }
+    if (isOnOrAfterRange(pull.merged_at, rangeStartMs) && pull.merged_at) {
+      const mergedKey = pull.merged_at.slice(0, 10);
+      const mergedBucket = prBuckets.get(mergedKey) ?? { merged: 0, open: 0, closed: 0 };
+      mergedBucket.merged += 1;
+      prBuckets.set(mergedKey, mergedBucket);
+      mergedPrs += 1;
+    }
 
+    if (new Date(pull.updated_at).getTime() >= rangeStartMs) {
       const category = classifyWork(
         pull.title,
         pull.labels.map((label) => label.name),
@@ -525,53 +915,80 @@ async function collectRepoAggregate(
         author: pull.user.login,
         timestamp: pull.updated_at,
       });
-    });
-
-  const filteredIssues = issues
-    .filter((issue) => !issue.pull_request)
-    .filter((issue) => new Date(issue.updated_at).getTime() >= rangeStartMs);
-
-  filteredIssues.forEach((issue) => {
-    if (issue.state === 'open') openIssues += 1;
-    if (issue.closed_at) closedIssues += 1;
-
-    const category = classifyWork(
-      issue.title,
-      issue.labels.map((label) => label.name),
-    );
-    workCounters[category] += 1;
-
-    recentEvents.push({
-      id: `issue-${issue.id}`,
-      type: 'issue',
-      repo: repo.name,
-      message: `Issue #${issue.number}: ${issue.title}`,
-      time: getRelativeTime(issue.updated_at),
-      url: issue.html_url,
-      author: issue.user.login,
-      timestamp: issue.updated_at,
-    });
+    }
   });
 
-  const done = pulls.filter((pull) => Boolean(pull.merged_at) && new Date(pull.updated_at).getTime() >= rangeStartMs).length;
+  const filteredIssues = issues.filter((issue) => !issue.pull_request);
+
+  filteredIssues.forEach((issue) => {
+    if (issue.state === 'open') {
+      openIssues += 1;
+    }
+
+    if (isOnOrAfterRange(issue.closed_at, rangeStartMs)) {
+      closedIssues += 1;
+    }
+
+    if (new Date(issue.updated_at).getTime() >= rangeStartMs) {
+      const category = classifyWork(
+        issue.title,
+        issue.labels.map((label) => label.name),
+      );
+      workCounters[category] += 1;
+
+      recentEvents.push({
+        id: `issue-${issue.id}`,
+        type: 'issue',
+        repo: repo.name,
+        message: `Issue #${issue.number}: ${issue.title}`,
+        time: getRelativeTime(issue.updated_at),
+        url: issue.html_url,
+        author: issue.user.login,
+        timestamp: issue.updated_at,
+      });
+    }
+  });
+
+  const done = pulls.filter((pull) => isOnOrAfterRange(pull.merged_at, rangeStartMs)).length;
   const inProgress = pulls.filter((pull) => pull.state === 'open' && new Date(pull.updated_at).getTime() >= rangeStartMs).length;
-  const todo = filteredIssues.filter((issue) => issue.state === 'open').length;
+  const todo = filteredIssues.filter((issue) => issue.state === 'open' && new Date(issue.updated_at).getTime() >= rangeStartMs).length;
+  const sortedContributors = Array.from(contributors.values()).sort((a, b) => b.contributions - a.contributions);
+  const fallbackRepoProjectStat: RepoProjectStat = {
+    name: repo.name,
+    statuses: [
+      { name: 'Done', count: done },
+      { name: 'In Progress', count: inProgress },
+      { name: 'To Do', count: todo },
+    ],
+    openIssues,
+    closedIssues,
+    openPullRequests: inProgress,
+    mergedPullRequests: mergedPrs,
+    done,
+    total: todo + inProgress + done,
+    source: 'activity-fallback',
+    projectTitle: null,
+  };
 
   return {
     topRepo: {
       name: repo.name,
       commits: commits.length,
       language: repo.language ?? 'Unknown',
+      contributors: sortedContributors.slice(0, 4),
     },
     recentEvents,
-    contributors: Array.from(contributors.values()),
-    repoProjectStat: {
-      name: repo.name,
-      todo,
-      inProgress,
-      done,
-      total: todo + inProgress + done,
-    },
+    contributors: sortedContributors,
+    repoProjectStat: githubProjectStat
+      ? {
+          name: repo.name,
+          ...githubProjectStat,
+          openIssues,
+          closedIssues,
+          openPullRequests: inProgress,
+          mergedPullRequests: mergedPrs,
+        }
+      : fallbackRepoProjectStat,
     milestones: repoMilestones.map((milestone) => ({ repo: repo.name, milestone })),
     workCounters,
     mergedPrs,

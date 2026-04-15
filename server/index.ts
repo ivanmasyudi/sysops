@@ -7,6 +7,7 @@ import {
   clearDashboardCache,
   getDashboardCacheStats,
   getDashboardData,
+  getGithubDebugSnapshot,
   verifyGithubWebhookSignature,
 } from './github';
 
@@ -154,6 +155,33 @@ app.get('/api/dashboard', async (_req, res) => {
     const message = error instanceof Error ? error.message : 'Unknown error';
     res.status(500).json({
       error: 'Failed to load GitHub dashboard data.',
+      details: message,
+    });
+  }
+});
+
+app.get('/api/debug/github', async (_req, res) => {
+  const owner = getOwner();
+  const token = process.env.GITHUB_TOKEN;
+
+  if (!owner || !token) {
+    res.status(503).json({
+      error: 'GitHub integration is not fully configured.',
+      missing: {
+        GITHUB_OWNER: !owner,
+        GITHUB_TOKEN: !token,
+      },
+    });
+    return;
+  }
+
+  try {
+    const payload = await getGithubDebugSnapshot(owner, token, getRepos());
+    res.json(payload);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    res.status(500).json({
+      error: 'Failed to inspect GitHub access.',
       details: message,
     });
   }
