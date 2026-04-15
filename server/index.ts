@@ -17,7 +17,6 @@ const app = express();
 const preferredPort = Number(process.env.PORT ?? 8787);
 const maxPortAttempts = 10;
 const eventClients = new Set<Response>();
-const warmupDayOptions = [7, 30, 90, 365];
 
 function broadcastEvent(event: string, data: Record<string, unknown>): void {
   const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
@@ -67,21 +66,23 @@ async function warmDashboardCache(): Promise<void> {
 
   const repos = getRepos();
   const warmupStart = Date.now();
-  console.log(`[dashboard:warmup] start owner=${owner} filters=${warmupDayOptions.join(',')}`);
+  const now = new Date();
+  const currentMonth = now.getUTCMonth() + 1;
+  const currentYear = now.getUTCFullYear();
+  console.log(`[dashboard:warmup] start owner=${owner} period=${currentYear}-${String(currentMonth).padStart(2, '0')}`);
 
-  const results = await Promise.allSettled(
-    warmupDayOptions.map((days) =>
-      getDashboardData(
-        {
-          owner,
-          repos,
-          token,
-          days,
-        },
-        'webhook-preload',
-      ),
+  const results = await Promise.allSettled([
+    getDashboardData(
+      {
+        owner,
+        repos,
+        token,
+        month: currentMonth,
+        year: currentYear,
+      },
+      'webhook-preload',
     ),
-  );
+  ]);
 
   const fulfilled = results.filter((result) => result.status === 'fulfilled').length;
   const failed = results.length - fulfilled;
@@ -91,7 +92,7 @@ async function warmDashboardCache(): Promise<void> {
 
   results.forEach((result, index) => {
     if (result.status === 'rejected') {
-      console.error(`[dashboard:warmup] failed days=${warmupDayOptions[index]}`, result.reason);
+      console.error(`[dashboard:warmup] failed periodIndex=${index}`, result.reason);
     }
   });
 }
@@ -130,7 +131,9 @@ app.get('/api/events', (req, res) => {
 app.get('/api/dashboard', async (_req, res) => {
   const owner = getOwner();
   const token = process.env.GITHUB_TOKEN;
-  const rawDays = typeof _req.query.days === 'string' ? Number(_req.query.days) : 30;
+  const now = new Date();
+  const rawMonth = typeof _req.query.month === 'string' ? Number(_req.query.month) : now.getUTCMonth() + 1;
+  const rawYear = typeof _req.query.year === 'string' ? Number(_req.query.year) : now.getUTCFullYear();
 
   if (!owner || !token) {
     res.status(503).json({
@@ -148,7 +151,8 @@ app.get('/api/dashboard', async (_req, res) => {
       owner,
       repos: getRepos(),
       token,
-      days: rawDays,
+      month: rawMonth,
+      year: rawYear,
     });
     res.json(payload);
   } catch (error) {

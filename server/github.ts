@@ -13,6 +13,10 @@ type GithubRepo = {
   };
 };
 
+type GithubBranch = {
+  name: string;
+};
+
 type GithubCommit = {
   sha: string;
   html_url: string;
@@ -83,6 +87,10 @@ type DailyPoint = {
   date: string;
   isoDate: string;
   commits: number;
+  repoBreakdown?: Array<{
+    repo: string;
+    commits: number;
+  }>;
 };
 
 type PullRequestPoint = {
@@ -98,6 +106,10 @@ type HeatmapDay = {
   isoDate: string;
   count: number;
   intensity: number;
+  repoBreakdown?: Array<{
+    repo: string;
+    commits: number;
+  }>;
 };
 
 type HeatmapWeek = HeatmapDay[];
@@ -140,7 +152,7 @@ type RepoProjectStat = {
   mergedPullRequests: number;
   done: number;
   total: number;
-  source?: 'github-project' | 'activity-fallback';
+  source?: 'github-project' | 'activity-fallback' | 'unavailable';
   projectTitle?: string | null;
 };
 
@@ -163,7 +175,9 @@ type CurrentMilestone = {
 export type DashboardPayload = {
   generatedAt: string;
   owner: string;
-  selectedDays: number;
+  selectedMonth: number;
+  selectedYear: number;
+  selectedLabel: string;
   repos: GithubRepo[];
   summary: {
     systemUpdates: number;
@@ -188,7 +202,8 @@ type FetchOptions = {
   owner: string;
   repos: string[];
   token: string;
-  days: number;
+  month: number;
+  year: number;
 };
 
 type RepoAggregate = {
@@ -206,8 +221,10 @@ type RepoAggregate = {
   openIssues: number;
   closedIssues: number;
   commitBuckets: Map<string, number>;
+  activityRepoBuckets: Map<string, number>;
   prBuckets: Map<string, { merged: number; open: number; closed: number }>;
   heatmapBuckets: Map<string, number>;
+  heatmapRepoBuckets: Map<string, number>;
 };
 
 type CacheEntry = {
@@ -215,6 +232,21 @@ type CacheEntry = {
   payload: DashboardPayload;
   warmedAt: number;
   source: 'request' | 'webhook-preload';
+};
+
+type RepoProjectStatSnapshot = Pick<
+  RepoProjectStat,
+  'statuses' | 'openIssues' | 'closedIssues' | 'openPullRequests' | 'mergedPullRequests' | 'done' | 'total' | 'source' | 'projectTitle'
+>;
+
+type RepoProjectStatCacheEntry = {
+  expiresAt: number;
+  value: RepoProjectStatSnapshot | null;
+};
+
+type HeatmapCacheEntry = {
+  expiresAt: number;
+  data: HeatmapWeek[];
 };
 
 type GithubViewer = {
@@ -230,7 +262,8 @@ type DashboardTimings = {
   assemblePayloadMs: number;
   repoCount: number;
   cacheStatus: 'hit' | 'miss';
-  selectedDays: number;
+  selectedMonth: number;
+  selectedYear: number;
 };
 
 type GithubGraphqlResponse<T> = {
@@ -273,7 +306,12 @@ const COLORS = {
 };
 
 const cache = new Map<string, CacheEntry>();
+const repoProjectStatCache = new Map<string, RepoProjectStatCacheEntry>();
+const repoProjectStatInFlight = new Map<string, Promise<RepoProjectStatSnapshot | null>>();
+const heatmapCache = new Map<string, HeatmapCacheEntry>();
 const DEFAULT_CACHE_TTL_MS = 60 * 1000;
+const PROJECT_STAT_CACHE_TTL_MS = 5 * 60 * 1000;
+const HEATMAP_CACHE_TTL_MS = 15 * 60 * 1000;
 
 function parseGithubLoginList(raw: string | undefined): string[] {
   return (raw ?? '')
@@ -326,17 +364,26 @@ function resolveContributorRole(loginOrName: string, roleMap: Map<string, string
   return roleMap.get(loginOrName.trim().toLowerCase()) ?? 'Contributor';
 }
 
-function createCacheKey(owner: string, repos: string[], days: number): string {
+function createCacheKey(owner: string, repos: string[], month: number, year: number): string {
   return JSON.stringify({
     owner,
     repos: [...repos].sort(),
-    days,
+    month,
+    year,
+  });
+}
+
+function createHeatmapCacheKey(owner: string, repos: string[], year: number): string {
+  return JSON.stringify({
+    owner,
+    repos: [...repos].sort(),
+    heatmapYear: year,
   });
 }
 
 function logDashboardTimings(label: string, timings: DashboardTimings): void {
   console.log(
-    `[dashboard:${label}] cache=${timings.cacheStatus} days=${timings.selectedDays} repos=${timings.repoCount} total=${timings.totalMs.toFixed(0)}ms resolveRepos=${timings.resolveReposMs.toFixed(0)}ms aggregateRepos=${timings.aggregateReposMs.toFixed(0)}ms assemble=${timings.assemblePayloadMs.toFixed(0)}ms`,
+    `[dashboard:${label}] cache=${timings.cacheStatus} period=${timings.selectedYear}-${String(timings.selectedMonth).padStart(2, '0')} repos=${timings.repoCount} total=${timings.totalMs.toFixed(0)}ms resolveRepos=${timings.resolveReposMs.toFixed(0)}ms aggregateRepos=${timings.aggregateReposMs.toFixed(0)}ms assemble=${timings.assemblePayloadMs.toFixed(0)}ms`,
   );
 }
 
@@ -360,6 +407,65 @@ async function githubRequest<T>(path: string, token: string): Promise<T> {
   }
 
   return response.json() as Promise<T>;
+}
+
+async function githubRequestPage<T>(
+  path: string,
+  token: string,
+): Promise<{ data: T; linkHeader: string | null }> {
+  const response = await fetch(`${GITHUB_API_BASE}${path}`, {
+    headers: getAuthHeaders(token),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`GitHub API ${response.status}: ${text}`);
+  }
+
+  return {
+    data: (await response.json()) as T,
+    linkHeader: response.headers.get('link'),
+  };
+}
+
+function getNextPagePath(linkHeader: string | null): string | null {
+  if (!linkHeader) {
+    return null;
+  }
+
+  const nextPart = linkHeader
+    .split(',')
+    .map((part) => part.trim())
+    .find((part) => part.includes('rel="next"'));
+
+  if (!nextPart) {
+    return null;
+  }
+
+  const match = nextPart.match(/<([^>]+)>/);
+  if (!match) {
+    return null;
+  }
+
+  const nextUrl = new URL(match[1]);
+  if (nextUrl.origin !== GITHUB_API_BASE) {
+    return null;
+  }
+
+  return `${nextUrl.pathname}${nextUrl.search}`;
+}
+
+async function githubRequestAllPages<T>(path: string, token: string): Promise<T[]> {
+  const items: T[] = [];
+  let nextPath = path;
+
+  while (nextPath) {
+    const page = await githubRequestPage<T[]>(nextPath, token);
+    items.push(...page.data);
+    nextPath = getNextPagePath(page.linkHeader);
+  }
+
+  return items;
 }
 
 async function githubGraphqlRequest<T>(query: string, variables: Record<string, unknown>, token: string): Promise<T> {
@@ -539,6 +645,36 @@ function startOfDay(date: Date): Date {
   return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
 }
 
+function normalizeMonth(month: number): number {
+  if (!Number.isFinite(month)) return new Date().getUTCMonth() + 1;
+  return Math.min(12, Math.max(1, Math.round(month)));
+}
+
+function normalizeYear(year: number): number {
+  if (!Number.isFinite(year)) return new Date().getUTCFullYear();
+  return Math.min(2100, Math.max(2000, Math.round(year)));
+}
+
+function getMonthRange(year: number, month: number): { start: Date; end: Date; dayCount: number } {
+  const normalizedYear = normalizeYear(year);
+  const normalizedMonth = normalizeMonth(month);
+  const start = new Date(Date.UTC(normalizedYear, normalizedMonth - 1, 1));
+  const end = new Date(Date.UTC(normalizedYear, normalizedMonth, 0, 23, 59, 59, 999));
+  return {
+    start,
+    end,
+    dayCount: end.getUTCDate(),
+  };
+}
+
+function formatMonthLabel(date: Date): string {
+  return new Intl.DateTimeFormat('en-US', {
+    month: 'long',
+    year: 'numeric',
+    timeZone: 'UTC',
+  }).format(date);
+}
+
 function formatLabel(date: Date): string {
   return new Intl.DateTimeFormat('en-US', {
     month: 'short',
@@ -579,10 +715,9 @@ function getRelativeTime(input: string): string {
   return `${days} days ago`;
 }
 
-function createEmptyDailySeries(days: number): DailyPoint[] {
-  const today = startOfDay(new Date());
-  return Array.from({ length: days }, (_, index) => {
-    const date = new Date(today.getTime() - (days - 1 - index) * DAY);
+function createEmptyDailySeries(start: Date, dayCount: number): DailyPoint[] {
+  return Array.from({ length: dayCount }, (_, index) => {
+    const date = new Date(start.getTime() + index * DAY);
     return {
       date: formatLabel(date),
       isoDate: date.toISOString(),
@@ -591,10 +726,9 @@ function createEmptyDailySeries(days: number): DailyPoint[] {
   });
 }
 
-function createEmptyPrSeries(days: number): PullRequestPoint[] {
-  const today = startOfDay(new Date());
-  return Array.from({ length: days }, (_, index) => {
-    const date = new Date(today.getTime() - (days - 1 - index) * DAY);
+function createEmptyPrSeries(start: Date, dayCount: number): PullRequestPoint[] {
+  return Array.from({ length: dayCount }, (_, index) => {
+    const date = new Date(start.getTime() + index * DAY);
     return {
       date: formatLabel(date),
       isoDate: date.toISOString(),
@@ -605,11 +739,13 @@ function createEmptyPrSeries(days: number): PullRequestPoint[] {
   });
 }
 
-function createEmptyHeatmap(weeks: number): HeatmapWeek[] {
-  const totalDays = weeks * 7;
-  const start = startOfDay(new Date(Date.now() - (totalDays - 1) * DAY));
+function createEmptyHeatmap(start: Date, end: Date): HeatmapWeek[] {
+  const startOffset = (start.getUTCDay() + 6) % 7;
+  const gridStart = new Date(start.getTime() - startOffset * DAY);
+  const endOffset = (7 - ((end.getUTCDay() + 6) % 7) - 1 + 7) % 7;
+  const totalDays = Math.round((end.getTime() - gridStart.getTime()) / DAY) + 1 + endOffset;
   const days = Array.from({ length: totalDays }, (_, index) => {
-    const date = new Date(start.getTime() + index * DAY);
+    const date = new Date(gridStart.getTime() + index * DAY);
     return {
       date: formatDateLong(date),
       isoDate: date.toISOString(),
@@ -619,18 +755,11 @@ function createEmptyHeatmap(weeks: number): HeatmapWeek[] {
   });
 
   const weeksData: HeatmapWeek[] = [];
+  const weeks = Math.ceil(totalDays / 7);
   for (let week = 0; week < weeks; week += 1) {
     weeksData.push(days.slice(week * 7, week * 7 + 7));
   }
   return weeksData;
-}
-
-function normalizeDays(days: number): number {
-  if (!Number.isFinite(days)) return 30;
-  if (days <= 7) return 7;
-  if (days <= 30) return 30;
-  if (days <= 90) return 90;
-  return 365;
 }
 
 function scoreIntensity(count: number): number {
@@ -645,6 +774,19 @@ function isOnOrAfterRange(input: string | null | undefined, rangeStartMs: number
   return Boolean(input) && new Date(input as string).getTime() >= rangeStartMs;
 }
 
+function isWithinRange(
+  input: string | null | undefined,
+  rangeStartMs: number,
+  rangeEndMs: number,
+): boolean {
+  if (!input) {
+    return false;
+  }
+
+  const time = new Date(input).getTime();
+  return time >= rangeStartMs && time <= rangeEndMs;
+}
+
 function classifyWork(text: string, labels: string[]): 'feature' | 'fix' | 'maintenance' {
   const haystack = `${text} ${labels.join(' ')}`.toLowerCase();
   if (/(fix|bug|error|incident|hotfix|defect|patch)/.test(haystack)) {
@@ -656,12 +798,39 @@ function classifyWork(text: string, labels: string[]): 'feature' | 'fix' | 'main
   return 'maintenance';
 }
 
-async function fetchRepoCommits(owner: string, repo: string, token: string, sinceIso: string) {
+async function fetchRepoBranches(owner: string, repo: string, token: string) {
+  return githubRequestAllPages<GithubBranch>(`/repos/${owner}/${repo}/branches?per_page=100`, token);
+}
+
+async function fetchRepoCommitsForRef(
+  owner: string,
+  repo: string,
+  token: string,
+  sinceIso: string,
+  untilIso: string,
+  refName?: string,
+) {
+  const refQuery = refName ? `&sha=${encodeURIComponent(refName)}` : '';
+  return githubRequestAllPages<GithubCommit>(
+    `/repos/${owner}/${repo}/commits?per_page=100&since=${encodeURIComponent(sinceIso)}&until=${encodeURIComponent(untilIso)}${refQuery}`,
+    token,
+  );
+}
+
+async function fetchRepoCommits(owner: string, repo: string, token: string, sinceIso: string, untilIso: string) {
   try {
-    return await githubRequest<GithubCommit[]>(
-      `/repos/${owner}/${repo}/commits?per_page=100&since=${encodeURIComponent(sinceIso)}`,
-      token,
-    );
+    const branches = await fetchRepoBranches(owner, repo, token).catch(() => []);
+    const refs = branches.length > 0 ? Array.from(new Set(branches.map((branch) => branch.name))) : [undefined];
+    const uniqueCommits = new Map<string, GithubCommit>();
+
+    for (const refName of refs) {
+      const branchCommits = await fetchRepoCommitsForRef(owner, repo, token, sinceIso, untilIso, refName);
+      branchCommits.forEach((commit) => {
+        uniqueCommits.set(commit.sha, commit);
+      });
+    }
+
+    return [...uniqueCommits.values()];
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (message.includes('Git Repository is empty')) {
@@ -701,12 +870,7 @@ async function fetchRepoProjectStat(
   owner: string,
   repo: string,
   token: string,
-): Promise<
-  Pick<
-    RepoProjectStat,
-    'statuses' | 'openIssues' | 'closedIssues' | 'openPullRequests' | 'mergedPullRequests' | 'done' | 'total' | 'source' | 'projectTitle'
-  > | null
-> {
+): Promise<RepoProjectStatSnapshot | null> {
   const data = await githubGraphqlRequest<{
     repository: {
       projectsV2: {
@@ -812,27 +976,163 @@ async function fetchRepoProjectStat(
   };
 }
 
+async function fetchRepoProjectStatCached(
+  owner: string,
+  repo: string,
+  token: string,
+): Promise<RepoProjectStatSnapshot | null> {
+  const cacheKey = `${owner}/${repo}`;
+  const cached = repoProjectStatCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.value;
+  }
+
+  const inFlight = repoProjectStatInFlight.get(cacheKey);
+  if (inFlight) {
+    return inFlight;
+  }
+
+  const request = (async () => {
+    try {
+      const value = await fetchRepoProjectStat(owner, repo, token);
+      repoProjectStatCache.set(cacheKey, {
+        value,
+        expiresAt: Date.now() + PROJECT_STAT_CACHE_TTL_MS,
+      });
+      return value;
+    } catch (error) {
+      if (cached) {
+        console.warn(
+          `[dashboard:repo-project-cache] using stale project stat for ${cacheKey} because refresh failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+        return cached.value;
+      }
+
+      console.warn(
+        `[dashboard:repo-project-cache] project stat unavailable for ${cacheKey}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return {
+        statuses: [],
+        openIssues: 0,
+        closedIssues: 0,
+        openPullRequests: 0,
+        mergedPullRequests: 0,
+        done: 0,
+        total: 0,
+        source: 'unavailable',
+        projectTitle: null,
+      } satisfies RepoProjectStatSnapshot;
+    } finally {
+      repoProjectStatInFlight.delete(cacheKey);
+    }
+  })();
+
+  repoProjectStatInFlight.set(cacheKey, request);
+  return request;
+}
+
+function cloneHeatmapData(heatmapData: HeatmapWeek[]): HeatmapWeek[] {
+  return heatmapData.map((week) =>
+    week.map((day) => ({
+      ...day,
+      repoBreakdown: day.repoBreakdown?.map((item) => ({ ...item })),
+    })),
+  );
+}
+
+async function getYearHeatmapData(
+  owner: string,
+  repos: GithubRepo[],
+  token: string,
+  year: number,
+): Promise<HeatmapWeek[]> {
+  const cacheKey = createHeatmapCacheKey(owner, repos.map((repo) => repo.name), year);
+  const cached = heatmapCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cloneHeatmapData(cached.data);
+  }
+
+  const yearStart = getMonthRange(year, 1).start;
+  const yearEnd = getMonthRange(year, 12).end;
+  const heatmapData = createEmptyHeatmap(yearStart, yearEnd);
+  const heatmapIndex = new Map(
+    heatmapData.flat().map((day, index) => [day.isoDate.slice(0, 10), index]),
+  );
+
+  const repoCommitSets = await Promise.all(
+    repos.map(async (repo) => ({
+      repo: repo.name,
+      commits: await fetchRepoCommits(owner, repo.name, token, yearStart.toISOString(), yearEnd.toISOString()),
+    })),
+  );
+
+  repoCommitSets.forEach(({ repo, commits }) => {
+    commits.forEach((commit) => {
+      const dateKey = commit.commit.author.date.slice(0, 10);
+      const heatmapPos = heatmapIndex.get(dateKey);
+      if (heatmapPos === undefined) {
+        return;
+      }
+
+      const week = Math.floor(heatmapPos / 7);
+      const day = heatmapPos % 7;
+      heatmapData[week][day].count += 1;
+
+      const existingBreakdown = heatmapData[week][day].repoBreakdown ?? [];
+      const existingRepo = existingBreakdown.find((item) => item.repo === repo);
+      if (existingRepo) {
+        existingRepo.commits += 1;
+      } else {
+        existingBreakdown.push({
+          repo,
+          commits: 1,
+        });
+      }
+      heatmapData[week][day].repoBreakdown = existingBreakdown.sort((a, b) => b.commits - a.commits);
+    });
+  });
+
+  heatmapData.flat().forEach((day) => {
+    day.intensity = scoreIntensity(day.count);
+  });
+
+  heatmapCache.set(cacheKey, {
+    data: cloneHeatmapData(heatmapData),
+    expiresAt: Date.now() + HEATMAP_CACHE_TTL_MS,
+  });
+
+  return heatmapData;
+}
+
 async function collectRepoAggregate(
   owner: string,
   repo: GithubRepo,
   token: string,
   since: string,
+  until: string,
 ): Promise<RepoAggregate> {
   const contributorRoleMap = getContributorRoleMap();
-  const [commits, pulls, issues, repoMilestones, githubProjectStat] = await Promise.all([
-    fetchRepoCommits(owner, repo.name, token, since),
+  const githubProjectStat = await fetchRepoProjectStatCached(owner, repo.name, token);
+  const [commits, pulls, issues, repoMilestones] = await Promise.all([
+    fetchRepoCommits(owner, repo.name, token, since, until),
     fetchRepoPulls(owner, repo.name, token),
     fetchRepoIssues(owner, repo.name, token),
     fetchRepoMilestones(owner, repo.name, token).catch(() => []),
-    fetchRepoProjectStat(owner, repo.name, token).catch(() => null),
   ]);
 
   const rangeStartMs = new Date(since).getTime();
+  const rangeEndMs = new Date(until).getTime();
   const recentEvents: RecentEvent[] = [];
   const contributors = new Map<string, TeamMember>();
   const commitBuckets = new Map<string, number>();
+  const activityRepoBuckets = new Map<string, number>();
   const prBuckets = new Map<string, { merged: number; open: number; closed: number }>();
   const heatmapBuckets = new Map<string, number>();
+  const heatmapRepoBuckets = new Map<string, number>();
   const workCounters = { feature: 0, fix: 0, maintenance: 0 };
 
   let mergedPrs = 0;
@@ -843,6 +1143,9 @@ async function collectRepoAggregate(
     const key = commit.commit.author.date.slice(0, 10);
     commitBuckets.set(key, (commitBuckets.get(key) ?? 0) + 1);
     heatmapBuckets.set(key, (heatmapBuckets.get(key) ?? 0) + 1);
+    const repoKey = `${key}::${repo.name}`;
+    activityRepoBuckets.set(repoKey, (activityRepoBuckets.get(repoKey) ?? 0) + 1);
+    heatmapRepoBuckets.set(repoKey, (heatmapRepoBuckets.get(repoKey) ?? 0) + 1);
 
     const category = classifyWork(commit.commit.message, []);
     workCounters[category] += 1;
@@ -876,21 +1179,21 @@ async function collectRepoAggregate(
   });
 
   pulls.forEach((pull) => {
-    if (isOnOrAfterRange(pull.created_at, rangeStartMs)) {
+    if (isWithinRange(pull.created_at, rangeStartMs, rangeEndMs)) {
       const createdKey = pull.created_at.slice(0, 10);
       const bucket = prBuckets.get(createdKey) ?? { merged: 0, open: 0, closed: 0 };
       bucket.open += 1;
       prBuckets.set(createdKey, bucket);
     }
 
-    if (isOnOrAfterRange(pull.closed_at, rangeStartMs) && pull.closed_at) {
+    if (isWithinRange(pull.closed_at, rangeStartMs, rangeEndMs) && pull.closed_at) {
       const closedKey = pull.closed_at.slice(0, 10);
       const closedBucket = prBuckets.get(closedKey) ?? { merged: 0, open: 0, closed: 0 };
       closedBucket.closed += 1;
       prBuckets.set(closedKey, closedBucket);
     }
 
-    if (isOnOrAfterRange(pull.merged_at, rangeStartMs) && pull.merged_at) {
+    if (isWithinRange(pull.merged_at, rangeStartMs, rangeEndMs) && pull.merged_at) {
       const mergedKey = pull.merged_at.slice(0, 10);
       const mergedBucket = prBuckets.get(mergedKey) ?? { merged: 0, open: 0, closed: 0 };
       mergedBucket.merged += 1;
@@ -898,7 +1201,7 @@ async function collectRepoAggregate(
       mergedPrs += 1;
     }
 
-    if (new Date(pull.updated_at).getTime() >= rangeStartMs) {
+    if (isWithinRange(pull.updated_at, rangeStartMs, rangeEndMs)) {
       const category = classifyWork(
         pull.title,
         pull.labels.map((label) => label.name),
@@ -925,11 +1228,11 @@ async function collectRepoAggregate(
       openIssues += 1;
     }
 
-    if (isOnOrAfterRange(issue.closed_at, rangeStartMs)) {
+    if (isWithinRange(issue.closed_at, rangeStartMs, rangeEndMs)) {
       closedIssues += 1;
     }
 
-    if (new Date(issue.updated_at).getTime() >= rangeStartMs) {
+    if (isWithinRange(issue.updated_at, rangeStartMs, rangeEndMs)) {
       const category = classifyWork(
         issue.title,
         issue.labels.map((label) => label.name),
@@ -949,9 +1252,13 @@ async function collectRepoAggregate(
     }
   });
 
-  const done = pulls.filter((pull) => isOnOrAfterRange(pull.merged_at, rangeStartMs)).length;
-  const inProgress = pulls.filter((pull) => pull.state === 'open' && new Date(pull.updated_at).getTime() >= rangeStartMs).length;
-  const todo = filteredIssues.filter((issue) => issue.state === 'open' && new Date(issue.updated_at).getTime() >= rangeStartMs).length;
+  const done = pulls.filter((pull) => isWithinRange(pull.merged_at, rangeStartMs, rangeEndMs)).length;
+  const inProgress = pulls.filter(
+    (pull) => pull.state === 'open' && isWithinRange(pull.updated_at, rangeStartMs, rangeEndMs),
+  ).length;
+  const todo = filteredIssues.filter(
+    (issue) => issue.state === 'open' && isWithinRange(issue.updated_at, rangeStartMs, rangeEndMs),
+  ).length;
   const sortedContributors = Array.from(contributors.values()).sort((a, b) => b.contributions - a.contributions);
   const fallbackRepoProjectStat: RepoProjectStat = {
     name: repo.name,
@@ -970,6 +1277,19 @@ async function collectRepoAggregate(
     projectTitle: null,
   };
 
+  const unavailableRepoProjectStat: RepoProjectStat = {
+    name: repo.name,
+    statuses: [],
+    openIssues: 0,
+    closedIssues: 0,
+    openPullRequests: 0,
+    mergedPullRequests: 0,
+    done: 0,
+    total: 0,
+    source: 'unavailable',
+    projectTitle: null,
+  };
+
   return {
     topRepo: {
       name: repo.name,
@@ -979,8 +1299,9 @@ async function collectRepoAggregate(
     },
     recentEvents,
     contributors: sortedContributors,
-    repoProjectStat: githubProjectStat
-      ? {
+    repoProjectStat:
+      githubProjectStat?.source === 'github-project'
+        ? {
           name: repo.name,
           ...githubProjectStat,
           openIssues,
@@ -988,22 +1309,26 @@ async function collectRepoAggregate(
           openPullRequests: inProgress,
           mergedPullRequests: mergedPrs,
         }
-      : fallbackRepoProjectStat,
+        : githubProjectStat?.source === 'unavailable'
+          ? unavailableRepoProjectStat
+          : fallbackRepoProjectStat,
     milestones: repoMilestones.map((milestone) => ({ repo: repo.name, milestone })),
     workCounters,
     mergedPrs,
     openIssues,
     closedIssues,
     commitBuckets,
+    activityRepoBuckets,
     prBuckets,
     heatmapBuckets,
+    heatmapRepoBuckets,
   };
 }
 
 function buildExecutiveSummary(payload: DashboardPayload): string {
   const topRepo = payload.topRepos[0];
   const milestone = payload.currentMilestone;
-  const rangeLabel = payload.selectedDays === 365 ? '365 hari terakhir' : `${payload.selectedDays} hari terakhir`;
+  const rangeLabel = payload.selectedLabel;
   const repoLine = topRepo
     ? `${topRepo.name} menjadi repo paling aktif dengan ${topRepo.commits} commit dalam ${rangeLabel}.`
     : 'Belum ada repo aktif yang terbaca dari konfigurasi saat ini.';
@@ -1016,6 +1341,9 @@ function buildExecutiveSummary(payload: DashboardPayload): string {
 
 export function clearDashboardCache(): void {
   cache.clear();
+  repoProjectStatCache.clear();
+  repoProjectStatInFlight.clear();
+  heatmapCache.clear();
 }
 
 export function getDashboardCacheStats(): { entries: number; keys: string[] } {
@@ -1033,13 +1361,44 @@ export function verifyGithubWebhookSignature(rawBody: Buffer, signatureHeader: s
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
+function mergeRepoProjectStatsWithPrevious(
+  current: RepoProjectStat[],
+  previous?: DashboardPayload,
+): RepoProjectStat[] {
+  if (!previous) {
+    return current;
+  }
+
+  const previousByRepo = new Map(previous.repoProjectStats.map((item) => [item.name, item]));
+
+  return current.map((item) => {
+    if (item.source === 'github-project') {
+      return item;
+    }
+
+    const previousItem = previousByRepo.get(item.name);
+    if (!previousItem || previousItem.source !== 'github-project') {
+      return item;
+    }
+
+    return {
+      ...previousItem,
+      openIssues: item.openIssues,
+      closedIssues: item.closedIssues,
+      openPullRequests: item.openPullRequests,
+      mergedPullRequests: item.mergedPullRequests,
+    };
+  });
+}
+
 export async function getDashboardData(
   options: FetchOptions,
   requestSource: 'request' | 'webhook-preload' = 'request',
 ): Promise<DashboardPayload> {
   const totalStart = performance.now();
-  const selectedDays = normalizeDays(options.days);
-  const cacheKey = createCacheKey(options.owner, options.repos, selectedDays);
+  const selectedMonth = normalizeMonth(options.month);
+  const selectedYear = normalizeYear(options.year);
+  const cacheKey = createCacheKey(options.owner, options.repos, selectedMonth, selectedYear);
   const cached = cache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) {
     logDashboardTimings(requestSource, {
@@ -1049,7 +1408,8 @@ export async function getDashboardData(
       assemblePayloadMs: 0,
       repoCount: cached.payload.repos.length,
       cacheStatus: 'hit',
-      selectedDays,
+      selectedMonth,
+      selectedYear,
     });
     return cached.payload;
   }
@@ -1057,16 +1417,15 @@ export async function getDashboardData(
   const resolveReposStart = performance.now();
   const repos = await resolveRepos(options.owner, options.token, options.repos);
   const resolveReposMs = performance.now() - resolveReposStart;
-  const since = new Date(Date.now() - selectedDays * DAY).toISOString();
-  const activityData = createEmptyDailySeries(selectedDays + 1);
-  const prData = createEmptyPrSeries(selectedDays);
-  const heatmapData = createEmptyHeatmap(Math.max(1, Math.ceil(selectedDays / 7)));
+  const monthRange = getMonthRange(selectedYear, selectedMonth);
+  const since = monthRange.start.toISOString();
+  const until = monthRange.end.toISOString();
+  const activityData = createEmptyDailySeries(monthRange.start, monthRange.dayCount);
+  const prData = createEmptyPrSeries(monthRange.start, monthRange.dayCount);
+  const heatmapData = await getYearHeatmapData(options.owner, repos, options.token, selectedYear);
 
   const dailyIndex = new Map(activityData.map((point, index) => [point.isoDate.slice(0, 10), index]));
   const prIndex = new Map(prData.map((point, index) => [point.isoDate.slice(0, 10), index]));
-  const heatmapIndex = new Map(
-    heatmapData.flat().map((day, index) => [day.isoDate.slice(0, 10), index]),
-  );
 
   const topRepos: TopRepo[] = [];
   const recentEvents: RecentEvent[] = [];
@@ -1081,7 +1440,7 @@ export async function getDashboardData(
 
   const aggregateReposStart = performance.now();
   const repoAggregates = await Promise.all(
-    repos.map((repo) => collectRepoAggregate(options.owner, repo, options.token, since)),
+    repos.map((repo) => collectRepoAggregate(options.owner, repo, options.token, since, until)),
   );
   const aggregateReposMs = performance.now() - aggregateReposStart;
 
@@ -1105,21 +1464,38 @@ export async function getDashboardData(
       }
     });
 
+    aggregate.activityRepoBuckets.forEach((count, key) => {
+      const separatorIndex = key.indexOf('::');
+      if (separatorIndex === -1) {
+        return;
+      }
+
+      const dateKey = key.slice(0, separatorIndex);
+      const repoName = key.slice(separatorIndex + 2);
+      const activityPos = dailyIndex.get(dateKey);
+      if (activityPos === undefined) {
+        return;
+      }
+
+      const existingBreakdown = activityData[activityPos].repoBreakdown ?? [];
+      const existingRepo = existingBreakdown.find((item) => item.repo === repoName);
+      if (existingRepo) {
+        existingRepo.commits += count;
+      } else {
+        existingBreakdown.push({
+          repo: repoName,
+          commits: count,
+        });
+      }
+      activityData[activityPos].repoBreakdown = existingBreakdown.sort((a, b) => b.commits - a.commits);
+    });
+
     aggregate.prBuckets.forEach((counts, key) => {
       const position = prIndex.get(key);
       if (position !== undefined) {
         prData[position].Merged += counts.merged;
         prData[position].Open += counts.open;
         prData[position].Closed += counts.closed;
-      }
-    });
-
-    aggregate.heatmapBuckets.forEach((count, key) => {
-      const heatmapPos = heatmapIndex.get(key);
-      if (heatmapPos !== undefined) {
-        const week = Math.floor(heatmapPos / 7);
-        const day = heatmapPos % 7;
-        heatmapData[week][day].count += count;
       }
     });
 
@@ -1133,9 +1509,7 @@ export async function getDashboardData(
     });
   });
 
-  heatmapData.flat().forEach((day) => {
-    day.intensity = scoreIntensity(day.count);
-  });
+  const mergedRepoProjectStats = mergeRepoProjectStatsWithPrevious(repoProjectStats, cached?.payload);
 
   topRepos.sort((a, b) => b.commits - a.commits);
   recentEvents.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
@@ -1193,7 +1567,9 @@ export async function getDashboardData(
   const payload: DashboardPayload = {
     generatedAt: new Date().toISOString(),
     owner: options.owner,
-    selectedDays,
+    selectedMonth,
+    selectedYear,
+    selectedLabel: formatMonthLabel(monthRange.start),
     repos,
     summary: {
       systemUpdates: activityData.reduce((sum, point) => sum + point.commits, 0),
@@ -1210,7 +1586,7 @@ export async function getDashboardData(
     topRepos: topRepos.slice(0, 6),
     workDistribution,
     teamMembers,
-    repoProjectStats,
+    repoProjectStats: mergedRepoProjectStats,
     currentMilestone,
   };
 
@@ -1231,7 +1607,8 @@ export async function getDashboardData(
     assemblePayloadMs,
     repoCount: repos.length,
     cacheStatus: 'miss',
-    selectedDays,
+    selectedMonth,
+    selectedYear,
   });
 
   return payload;

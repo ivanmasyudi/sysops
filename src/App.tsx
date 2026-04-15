@@ -12,7 +12,6 @@ import {
   Sparkles,
   Users,
   Target,
-  Kanban,
 } from "lucide-react";
 import {
   AreaChart,
@@ -35,6 +34,10 @@ type ActivityPoint = {
   date: string;
   isoDate?: string;
   commits: number;
+  repoBreakdown?: Array<{
+    repo: string;
+    commits: number;
+  }>;
 };
 
 type PullRequestPoint = {
@@ -90,7 +93,7 @@ type RepoProjectStatItem = {
   mergedPullRequests: number;
   done: number;
   total: number;
-  source?: "github-project" | "activity-fallback";
+  source?: "github-project" | "activity-fallback" | "unavailable";
   projectTitle?: string | null;
 };
 
@@ -109,12 +112,18 @@ type HeatmapDay = {
   count: number;
   intensity: number;
   isoDate?: string;
+  repoBreakdown?: Array<{
+    repo: string;
+    commits: number;
+  }>;
 };
 
 type DashboardPayload = {
   generatedAt: string;
   owner: string;
-  selectedDays: number;
+  selectedMonth: number;
+  selectedYear: number;
+  selectedLabel: string;
   summary: {
     systemUpdates: number;
     featuresDelivered: number;
@@ -139,11 +148,19 @@ const API_BASE_URL =
     ?.VITE_API_BASE_URL ||
   (window.location.port === "3000" ? "http://localhost:8787" : "");
 
-const periodOptions = [
-  { label: "Last 7 Days", value: 7 },
-  { label: "Last 30 Days", value: 30 },
-  { label: "Last 90 Days", value: 90 },
-  { label: "Last 365 Days", value: 365 },
+const monthOptions = [
+  { label: "January", value: 1 },
+  { label: "February", value: 2 },
+  { label: "March", value: 3 },
+  { label: "April", value: 4 },
+  { label: "May", value: 5 },
+  { label: "June", value: 6 },
+  { label: "July", value: 7 },
+  { label: "August", value: 8 },
+  { label: "September", value: 9 },
+  { label: "October", value: 10 },
+  { label: "November", value: 11 },
+  { label: "December", value: 12 },
 ] as const;
 
 function getProjectStatusColor(statusName: string) {
@@ -426,7 +443,9 @@ const fallbackHeatmapData: HeatmapDay[][] = generateHeatmap();
 const fallbackDashboard: DashboardPayload = {
   generatedAt: new Date().toISOString(),
   owner: "organization-account",
-  selectedDays: 30,
+  selectedMonth: new Date().getMonth() + 1,
+  selectedYear: new Date().getFullYear(),
+  selectedLabel: format(new Date(), "MMMM yyyy"),
   summary: {
     systemUpdates: 1432,
     featuresDelivered: 45,
@@ -445,6 +464,47 @@ const fallbackDashboard: DashboardPayload = {
   teamMembers: fallbackTeamMembers,
   repoProjectStats: fallbackRepoProjectStats,
   currentMilestone: fallbackCurrentMilestone,
+};
+
+const ProductivityTooltip = ({
+  active,
+  payload,
+  label,
+}: {
+  active?: boolean;
+  payload?: Array<{ payload?: ActivityPoint; value?: number }>;
+  label?: string;
+}) => {
+  if (!active || !payload?.length || !payload[0]?.payload) {
+    return null;
+  }
+
+  const point = payload[0].payload;
+  const totalCommits = typeof payload[0].value === "number" ? payload[0].value : point.commits;
+
+  return (
+    <div className="min-w-[220px] max-w-[320px] rounded-lg border border-emerald-900/50 bg-[#0a0a0a] px-3 py-2.5 text-xs text-neutral-200 shadow-xl">
+      <div className="whitespace-nowrap">
+        <span className="font-semibold text-emerald-400">
+          {totalCommits} commits
+        </span>{" "}
+        on {label ?? point.date}
+      </div>
+      {point.repoBreakdown && point.repoBreakdown.length > 0 && (
+        <div className="mt-2 space-y-1.5 border-t border-emerald-900/30 pt-2">
+          {point.repoBreakdown.map((item) => (
+            <div
+              key={`${label ?? point.date}-${item.repo}`}
+              className="flex items-center justify-between gap-3"
+            >
+              <span className="truncate text-neutral-300">{item.repo}</span>
+              <span className="font-semibold text-white">{item.commits}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
 };
 
 // --- COMPONENTS ---
@@ -538,14 +598,23 @@ const IssueStatCard = ({
 export default function App() {
   const [dashboard, setDashboard] =
     useState<DashboardPayload>(fallbackDashboard);
-  const [selectedDays, setSelectedDays] = useState<number>(30);
+  const [selectedMonth, setSelectedMonth] = useState<number>(
+    fallbackDashboard.selectedMonth,
+  );
+  const [selectedYear, setSelectedYear] = useState<number>(
+    fallbackDashboard.selectedYear,
+  );
   const [tooltip, setTooltip] = useState<{
     show: boolean;
     x: number;
     y: number;
     date: string;
     count: number;
-  }>({ show: false, x: 0, y: 0, date: "", count: 0 });
+    repoBreakdown: Array<{
+      repo: string;
+      commits: number;
+    }>;
+  }>({ show: false, x: 0, y: 0, date: "", count: 0, repoBreakdown: [] });
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -564,7 +633,7 @@ export default function App() {
 
       try {
         const response = await fetch(
-          `${API_BASE_URL}/api/dashboard?days=${selectedDays}`,
+          `${API_BASE_URL}/api/dashboard?month=${selectedMonth}&year=${selectedYear}`,
         );
         if (!response.ok) {
           const payload = (await response.json().catch(() => null)) as {
@@ -583,11 +652,21 @@ export default function App() {
           setDashboard({
             ...fallbackDashboard,
             ...payload,
-            selectedDays:
-              typeof payload.selectedDays === "number" &&
-              Number.isFinite(payload.selectedDays)
-                ? payload.selectedDays
-                : selectedDays,
+            selectedMonth:
+              typeof payload.selectedMonth === "number" &&
+              Number.isFinite(payload.selectedMonth)
+                ? payload.selectedMonth
+                : selectedMonth,
+            selectedYear:
+              typeof payload.selectedYear === "number" &&
+              Number.isFinite(payload.selectedYear)
+                ? payload.selectedYear
+                : selectedYear,
+            selectedLabel:
+              typeof payload.selectedLabel === "string" &&
+              payload.selectedLabel.trim().length > 0
+                ? payload.selectedLabel
+                : `${monthOptions[selectedMonth - 1]?.label ?? "Month"} ${selectedYear}`,
           });
           setUsingFallback(false);
           setError(null);
@@ -633,7 +712,7 @@ export default function App() {
       }
       eventSource.close();
     };
-  }, [selectedDays]);
+  }, [selectedMonth, selectedYear]);
 
   const generatedAtLabel = new Intl.DateTimeFormat("id-ID", {
     dateStyle: "medium",
@@ -653,16 +732,50 @@ export default function App() {
   const prData = dashboard.prData;
   const teamMembers = dashboard.teamMembers;
   const currentMilestone = dashboard.currentMilestone;
-  const repoProjectStats = dashboard.repoProjectStats;
   const heatmapData = dashboard.heatmapData;
+  const heatmapDays = heatmapData.flat();
+  const activeHeatmapDays = heatmapDays.filter((day) => day.count > 0).length;
+  const totalHeatmapContributions = heatmapDays.reduce(
+    (sum, day) => sum + day.count,
+    0,
+  );
+  const heatmapPeakDay = heatmapDays.reduce(
+    (peak, day) => (day.count > peak.count ? day : peak),
+    heatmapDays[0] ?? { date: "-", count: 0, intensity: 0 },
+  );
+  const heatmapMonthLabels = heatmapData.map((week, index) => {
+    const weekStart = week[0]?.isoDate
+      ? new Date(week[0].isoDate)
+      : week[0]?.date
+        ? new Date(week[0].date)
+        : null;
+    if (!weekStart) {
+      return "";
+    }
+
+    const currentMonth = format(weekStart, "MMM");
+    if (index === 0) {
+      return currentMonth;
+    }
+
+    const previousWeekStart = heatmapData[index - 1]?.[0]?.isoDate
+      ? new Date(heatmapData[index - 1][0].isoDate as string)
+      : heatmapData[index - 1]?.[0]?.date
+        ? new Date(heatmapData[index - 1][0].date)
+        : null;
+
+    return previousWeekStart &&
+      format(previousWeekStart, "MMM") === currentMonth
+      ? ""
+      : currentMonth;
+  });
   const repoCommitMax = Math.max(...topRepos.map((repo) => repo.commits), 1);
   const commitTrend =
-    activityData.length > 7
-      ? `${activityData[activityData.length - 1].commits - activityData[activityData.length - 8].commits >= 0 ? "+" : ""}${activityData[activityData.length - 1].commits - activityData[activityData.length - 8].commits} vs minggu lalu`
+    activityData.length > 1
+      ? `${activityData[activityData.length - 1].commits >= activityData[0].commits ? "+" : ""}${activityData[activityData.length - 1].commits - activityData[0].commits} dari awal bulan`
       : "Live sync";
-  const selectedPeriodLabel =
-    periodOptions.find((option) => option.value === selectedDays)?.label ??
-    `Last ${selectedDays || 30} Days`;
+  const selectedPeriodLabel = dashboard.selectedLabel;
+  const heatmapYearLabel = String(selectedYear);
 
   return (
     <div className="min-h-screen bg-[#050505] text-neutral-200 font-sans selection:bg-emerald-500/30">
@@ -687,19 +800,42 @@ export default function App() {
             <div className="relative flex items-center px-3 py-2 bg-[#050505] border border-emerald-900/30 rounded-lg text-sm font-medium text-neutral-300">
               <CalendarIcon size={16} className="text-emerald-500" />
               <select
-                value={selectedDays}
+                value={selectedMonth}
                 onChange={(event) =>
-                  setSelectedDays(Number(event.target.value))
+                  setSelectedMonth(Number(event.target.value))
                 }
                 className="appearance-none bg-transparent text-neutral-200 outline-none cursor-pointer pl-2 pr-8"
               >
-                {periodOptions.map((option) => (
+                {monthOptions.map((option) => (
                   <option
                     key={option.value}
                     value={option.value}
                     className="bg-[#0a0a0a] text-neutral-200"
                   >
                     {option.label}
+                  </option>
+                ))}
+              </select>
+              <ChevronDown
+                size={14}
+                className="absolute right-3 text-neutral-500 pointer-events-none"
+              />
+            </div>
+            <div className="relative flex items-center px-3 py-2 bg-[#050505] border border-emerald-900/30 rounded-lg text-sm font-medium text-neutral-300">
+              <select
+                value={selectedYear}
+                onChange={(event) =>
+                  setSelectedYear(Number(event.target.value))
+                }
+                className="appearance-none bg-transparent text-neutral-200 outline-none cursor-pointer pr-8"
+              >
+                {Array.from({ length: 6 }, (_, index) => new Date().getFullYear() - 2 + index).map((year) => (
+                  <option
+                    key={year}
+                    value={year}
+                    className="bg-[#0a0a0a] text-neutral-200"
+                  >
+                    {year}
                   </option>
                 ))}
               </select>
@@ -842,13 +978,8 @@ export default function App() {
                     axisLine={false}
                   />
                   <Tooltip
-                    contentStyle={{
-                      backgroundColor: "#0a0a0a",
-                      borderColor: "#065f46",
-                      borderRadius: "8px",
-                      color: "#e5e5e5",
-                    }}
-                    itemStyle={{ color: "#10b981" }}
+                    content={<ProductivityTooltip />}
+                    cursor={{ stroke: "#10b981", strokeOpacity: 0.2 }}
                   />
                   <Area
                     type="monotone"
@@ -980,62 +1111,127 @@ export default function App() {
 
           {/* CONTRIBUTION HEATMAP */}
           <div className="lg:col-span-3 bg-[#0a0a0a] border border-emerald-900/20 rounded-xl p-6 flex flex-col">
-            <div>
-              <h2 className="text-lg font-semibold text-white mb-6">
-                Konsistensi Harian (Daily Consistency)
-              </h2>
-              <p className="text-xs text-neutral-500 mt-1 -mt-5 mb-6">
-                Bukti rekam jejak pekerjaan untuk{" "}
-                {selectedPeriodLabel.toLowerCase()}
-              </p>
-            </div>
-            <div className="flex-1 flex flex-col justify-center">
-              <div className="flex gap-1.5 overflow-x-auto pb-2">
-                {heatmapData.map((week, i) => (
-                  <div key={i} className="flex flex-col gap-1.5">
-                    {week.map((day, j) => {
-                      // Map intensity to Tailwind colors
-                      const colors = [
-                        "bg-neutral-900", // 0
-                        "bg-emerald-900/40", // 1
-                        "bg-emerald-700/60", // 2
-                        "bg-emerald-500/80", // 3
-                        "bg-emerald-400", // 4
-                      ];
-                      return (
-                        <div
-                          key={j}
-                          className={`w-3.5 h-3.5 rounded-sm ${colors[day.intensity]} transition-colors hover:ring-1 hover:ring-emerald-300 cursor-pointer`}
-                          onMouseEnter={(e) => {
-                            const rect =
-                              e.currentTarget.getBoundingClientRect();
-                            setTooltip({
-                              show: true,
-                              x: rect.left + rect.width / 2,
-                              y: rect.top - 8,
-                              date: day.date,
-                              count: day.count,
-                            });
-                          }}
-                          onMouseLeave={() =>
-                            setTooltip((prev) => ({ ...prev, show: false }))
-                          }
-                        />
-                      );
-                    })}
-                  </div>
-                ))}
+            <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
+              <div>
+                <h2 className="text-lg font-semibold text-white">
+                  Konsistensi Harian (Daily Consistency)
+                </h2>
+                <p className="text-xs text-neutral-500 mt-1">
+                  Bukti rekam jejak pekerjaan untuk tahun {heatmapYearLabel}
+                </p>
               </div>
-              <div className="flex items-center justify-end gap-2 mt-4 text-xs text-neutral-500">
-                <span>Less</span>
-                <div className="flex gap-1">
-                  <div className="w-3 h-3 rounded-sm bg-neutral-900"></div>
-                  <div className="w-3 h-3 rounded-sm bg-emerald-900/40"></div>
-                  <div className="w-3 h-3 rounded-sm bg-emerald-700/60"></div>
-                  <div className="w-3 h-3 rounded-sm bg-emerald-500/80"></div>
-                  <div className="w-3 h-3 rounded-sm bg-emerald-400"></div>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 lg:min-w-[24rem]">
+                <div className="rounded-lg border border-emerald-900/20 bg-[#050505] px-4 py-3">
+                  <div className="text-[10px] uppercase tracking-[0.18em] text-neutral-500">
+                    Active Days
+                  </div>
+                  <div className="mt-2 text-2xl font-semibold text-white">
+                    {activeHeatmapDays}
+                  </div>
                 </div>
-                <span>More</span>
+                <div className="rounded-lg border border-emerald-900/20 bg-[#050505] px-4 py-3">
+                  <div className="text-[10px] uppercase tracking-[0.18em] text-neutral-500">
+                    Total Activity
+                  </div>
+                  <div className="mt-2 text-2xl font-semibold text-white">
+                    {totalHeatmapContributions}
+                  </div>
+                </div>
+                <div className="rounded-lg border border-emerald-900/20 bg-[#050505] px-4 py-3">
+                  <div className="text-[10px] uppercase tracking-[0.18em] text-neutral-500">
+                    Peak Day
+                  </div>
+                  <div className="mt-2 text-sm font-semibold text-white">
+                    {heatmapPeakDay.count} kontribusi
+                  </div>
+                  <div className="text-[11px] text-neutral-500 mt-1">
+                    {heatmapPeakDay.date}
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div className="mt-6 rounded-xl border border-emerald-900/20 bg-[#050505] p-4 sm:p-5">
+              <div className="min-w-0">
+                <div className="min-w-0 flex-1">
+                  <div className="overflow-x-auto pb-3">
+                    <div className="inline-flex min-w-full flex-col gap-3">
+                      <div className="inline-flex gap-2 pl-[1px] text-[11px] text-neutral-500">
+                        {heatmapMonthLabels.map((label, index) => (
+                          <div
+                            key={`${label}-${index}`}
+                            className="w-4 flex-shrink-0 overflow-visible"
+                          >
+                            <span
+                              className={
+                                label
+                                  ? "block whitespace-nowrap"
+                                  : "block opacity-0"
+                              }
+                            >
+                              {label || "."}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="inline-flex gap-2 min-w-full">
+                        {heatmapData.map((week, i) => (
+                          <div key={i} className="flex flex-col gap-2">
+                            {week.map((day, j) => {
+                              const colors = [
+                                "bg-neutral-900 border-neutral-800",
+                                "bg-emerald-950/90 border-emerald-900/40",
+                                "bg-emerald-800/80 border-emerald-700/40",
+                                "bg-emerald-500/80 border-emerald-400/40",
+                                "bg-emerald-300 border-emerald-200/40",
+                              ];
+                              return (
+                                <div
+                                  key={j}
+                                  className={`h-4 w-4 rounded-[4px] border ${colors[day.intensity]} shadow-[inset_0_1px_0_rgba(255,255,255,0.04)] transition duration-150 hover:scale-110 hover:ring-2 hover:ring-emerald-300/70 cursor-pointer sm:h-4 sm:w-4`}
+                                  onMouseEnter={(e) => {
+                                    const rect =
+                                      e.currentTarget.getBoundingClientRect();
+                                    setTooltip({
+                                      show: true,
+                                      x: rect.left + rect.width / 2,
+                                    y: rect.top - 8,
+                                    date: day.date,
+                                    count: day.count,
+                                    repoBreakdown: day.repoBreakdown ?? [],
+                                  });
+                                }}
+                                  onMouseLeave={() =>
+                                    setTooltip((prev) => ({
+                                      ...prev,
+                                      show: false,
+                                    }))
+                                  }
+                                />
+                              );
+                            })}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div className="mt-4 flex flex-col gap-3 border-t border-emerald-900/20 pt-4 text-xs text-neutral-500 sm:flex-row sm:items-center sm:justify-between">
+                <div className="text-neutral-400">
+                  Semakin terang warnanya, semakin tinggi intensitas aktivitas
+                  pada hari tersebut.
+                </div>
+                <div className="flex items-center gap-2 self-end sm:self-auto">
+                  <span>Less</span>
+                  <div className="flex gap-1.5">
+                    <div className="w-3 h-3 rounded-sm border border-neutral-800 bg-neutral-900"></div>
+                    <div className="w-3 h-3 rounded-sm border border-emerald-900/40 bg-emerald-950/90"></div>
+                    <div className="w-3 h-3 rounded-sm border border-emerald-700/40 bg-emerald-800/80"></div>
+                    <div className="w-3 h-3 rounded-sm border border-emerald-400/40 bg-emerald-500/80"></div>
+                    <div className="w-3 h-3 rounded-sm border border-emerald-200/40 bg-emerald-300"></div>
+                  </div>
+                  <span>More</span>
+                </div>
               </div>
             </div>
           </div>
@@ -1170,116 +1366,6 @@ export default function App() {
           </div>
         </div>
 
-        {/* PROJECT BOARD PROGRESS */}
-        <div className="bg-[#0a0a0a] border border-emerald-900/20 rounded-xl p-6 mt-6">
-          <div className="flex items-start justify-between mb-6">
-            <div>
-              <h2 className="text-lg font-semibold text-white flex items-center gap-2">
-                <Kanban size={20} className="text-emerald-500" />
-                Status Papan Proyek (Project Board Progress)
-              </h2>
-              <p className="text-xs text-neutral-500 mt-1">
-                Sinkronisasi status tugas berdasarkan GitHub Project per repositori
-              </p>
-            </div>
-          </div>
-
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {repoProjectStats.map((repo, idx) => (
-              <div
-                key={idx}
-                className="bg-neutral-900/30 border border-neutral-800 rounded-lg p-5 hover:border-emerald-900/30 transition-colors"
-              >
-                <div className="flex justify-between items-center mb-3">
-                  <span className="font-medium text-neutral-200">
-                    {repo.name}
-                  </span>
-                  <span className="text-xs text-neutral-500">
-                    {repo.total} tasks
-                  </span>
-                </div>
-                <p className="mb-3 text-[11px] text-neutral-500">
-                  {repo.source === "github-project"
-                    ? `Tersinkron dari GitHub Project${repo.projectTitle ? `: ${repo.projectTitle}` : ""}`
-                    : "Fallback dari PR dan issue karena GitHub Project belum terbaca"}
-                </p>
-                <div className="mb-4 grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
-                  <div className="rounded-lg border border-neutral-800 bg-neutral-950/70 px-3 py-2">
-                    <span className="block text-[10px] uppercase tracking-wider text-neutral-500">
-                      Issue Open
-                    </span>
-                    <span className="mt-1 block text-sm font-semibold text-amber-300">
-                      {repo.openIssues}
-                    </span>
-                  </div>
-                  <div className="rounded-lg border border-neutral-800 bg-neutral-950/70 px-3 py-2">
-                    <span className="block text-[10px] uppercase tracking-wider text-neutral-500">
-                      Issue Closed
-                    </span>
-                    <span className="mt-1 block text-sm font-semibold text-emerald-300">
-                      {repo.closedIssues}
-                    </span>
-                  </div>
-                  <div className="rounded-lg border border-neutral-800 bg-neutral-950/70 px-3 py-2">
-                    <span className="block text-[10px] uppercase tracking-wider text-neutral-500">
-                      PR Open
-                    </span>
-                    <span className="mt-1 block text-sm font-semibold text-blue-300">
-                      {repo.openPullRequests}
-                    </span>
-                  </div>
-                  <div className="rounded-lg border border-neutral-800 bg-neutral-950/70 px-3 py-2">
-                    <span className="block text-[10px] uppercase tracking-wider text-neutral-500">
-                      PR Merged
-                    </span>
-                    <span className="mt-1 block text-sm font-semibold text-violet-300">
-                      {repo.mergedPullRequests}
-                    </span>
-                  </div>
-                </div>
-
-                {/* Progress Bar */}
-                <div className="w-full h-2 bg-neutral-950 rounded-full overflow-hidden flex mb-4 border border-neutral-800">
-                  {repo.statuses.map((status) => (
-                    <div
-                      key={`${repo.name}-${status.name}`}
-                      className={`h-full ${getProjectStatusColor(status.name).bar}`}
-                      style={{
-                        width: `${(status.count / Math.max(repo.total, 1)) * 100}%`,
-                      }}
-                      title={status.name}
-                    ></div>
-                  ))}
-                </div>
-
-                <div
-                  className="grid gap-2 text-center"
-                  style={{
-                    gridTemplateColumns: `repeat(${Math.max(repo.statuses.length, 1)}, minmax(0, 1fr))`,
-                  }}
-                >
-                  {repo.statuses.map((status, statusIndex) => {
-                    const color = getProjectStatusColor(status.name);
-                    return (
-                      <div
-                        key={`${repo.name}-${status.name}-stat`}
-                        className={`flex flex-col ${statusIndex > 0 ? "border-l border-neutral-800" : ""}`}
-                      >
-                        <span className={`text-lg font-bold ${color.text}`}>
-                          {status.count}
-                        </span>
-                        <span className="text-[10px] text-neutral-500 uppercase tracking-wider mt-0.5">
-                          {status.name}
-                        </span>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-
         {/* BOTTOM SECTION ROW 2 */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mt-6">
           {/* MILESTONE / TARGET RILIS */}
@@ -1403,11 +1489,30 @@ export default function App() {
           className="fixed z-50 pointer-events-none flex flex-col items-center transform -translate-x-1/2 -translate-y-full"
           style={{ left: tooltip.x, top: tooltip.y }}
         >
-          <div className="bg-[#0a0a0a] border border-emerald-900/50 text-neutral-200 text-xs py-1.5 px-2.5 rounded shadow-xl whitespace-nowrap">
-            <span className="font-semibold text-emerald-400">
-              {tooltip.count} contributions
-            </span>{" "}
-            on {tooltip.date}
+          <div className="min-w-[220px] max-w-[320px] bg-[#0a0a0a] border border-emerald-900/50 text-neutral-200 text-xs py-2.5 px-3 rounded shadow-xl">
+            <div className="whitespace-nowrap">
+              <span className="font-semibold text-emerald-400">
+                {tooltip.count} contributions
+              </span>{" "}
+              on {tooltip.date}
+            </div>
+            {tooltip.repoBreakdown.length > 0 && (
+              <div className="mt-2 border-t border-emerald-900/30 pt-2 space-y-1.5">
+                {tooltip.repoBreakdown.map((item) => (
+                  <div
+                    key={`${tooltip.date}-${item.repo}`}
+                    className="flex items-center justify-between gap-3"
+                  >
+                    <span className="truncate text-neutral-300">
+                      {item.repo}
+                    </span>
+                    <span className="font-semibold text-white">
+                      {item.commits}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
           <div className="w-2 h-2 bg-[#0a0a0a] border-b border-r border-emerald-900/50 transform rotate-45 -mt-1.5"></div>
         </div>
